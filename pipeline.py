@@ -10,6 +10,7 @@ from typing import Any, Sequence
 import fastf1
 import numpy as np
 import pandas as pd
+from fastf1.ergast import legacy as ergast_legacy
 from scipy.stats import spearmanr
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error
@@ -34,6 +35,8 @@ HISTORICAL_FEATURE_COLUMNS = [
     "DriverChampPos",
 ]
 FINISHED_LAP_PATTERN = re.compile(r"^\+\d+\sLap(?:s)?$")
+ERGAST_LEGACY_URL = "https://ergast.com/api/f1"
+ERGAST_REPLACEMENT_URL = "https://api.jolpi.ca/ergast/f1"
 
 
 @dataclass
@@ -53,7 +56,10 @@ def enable_cache(cache_dir: Path | str = CACHE_DIR) -> Path:
     """Enable local FastF1 cache in the requested directory."""
     cache_path = Path(cache_dir)
     cache_path.mkdir(parents=True, exist_ok=True)
+    fastf1.set_log_level("WARNING")
     fastf1.Cache.enable_cache(str(cache_path))
+    if ergast_legacy.base_url == ERGAST_LEGACY_URL:
+        ergast_legacy.base_url = ERGAST_REPLACEMENT_URL
     return cache_path
 
 
@@ -81,14 +87,33 @@ def is_dnf(status: Any) -> bool:
 
 def _round_numbers_for_season(year: int) -> list[int]:
     """Fetch all non-testing round numbers for a season."""
-    schedule = fastf1.get_event_schedule(year, include_testing=False)
-    round_numbers = pd.to_numeric(schedule["RoundNumber"], errors="coerce").dropna().astype(int).tolist()
-    return sorted({round_number for round_number in round_numbers if round_number > 0})
+    backend_errors: list[str] = []
+    current_utc_day = pd.Timestamp.utcnow().tz_localize(None).normalize()
+    for backend in ("fastf1", "f1timing", "ergast"):
+        try:
+            schedule = fastf1.get_event_schedule(year, include_testing=False, backend=backend)
+            if "EventDate" in schedule.columns:
+                event_dates = pd.to_datetime(schedule["EventDate"], errors="coerce")
+                if getattr(event_dates.dt, "tz", None) is not None:
+                    event_dates = event_dates.dt.tz_convert(None)
+                schedule = schedule.loc[event_dates.dt.normalize() <= current_utc_day]
+            round_numbers = pd.to_numeric(schedule["RoundNumber"], errors="coerce").dropna().astype(int).tolist()
+            unique_rounds = sorted({round_number for round_number in round_numbers if round_number > 0})
+            if unique_rounds:
+                return unique_rounds
+        except Exception as exc:  # noqa: BLE001
+            backend_errors.append(f"{backend}: {exc}")
+
+    print(
+        f"Warning: could not load event schedule for {year} from FastF1 backends "
+        f"({'; '.join(backend_errors)}). Falling back to rounds 1-30."
+    )
+    return list(range(1, 31))
 
 
 def _build_qualifying_frame(quali_session: Any) -> pd.DataFrame:
     """Build qualifying features for all drivers in a qualifying session."""
-    quali_results = quali_session.results.copy()
+    quali_results = quali_session.results.copy().reset_index(drop=True)
     if quali_results.empty:
         raise ValueError("Qualifying results are empty.")
 
@@ -135,13 +160,13 @@ def _load_round_dataframe(year: int, round_number: int) -> pd.DataFrame | None:
     try:
         quali_session = fastf1.get_session(year, round_number, "Q")
         race_session = fastf1.get_session(year, round_number, "R")
-        quali_session.load()
-        race_session.load()
+        quali_session.load(laps=False, telemetry=False, weather=False, messages=False)
+        race_session.load(laps=False, telemetry=False, weather=False, messages=False)
     except Exception as exc:  # noqa: BLE001
         print(f"Warning: skipping {year} round {round_number} because session load failed: {exc}")
         return None
 
-    race_results = race_session.results.copy()
+    race_results = race_session.results.copy().reset_index(drop=True)
     if race_results.empty:
         print(f"Warning: skipping {year} round {round_number} because race results are empty.")
         return None
@@ -272,13 +297,20 @@ def _fill_feature_nulls_with_session_median(
 ) -> pd.DataFrame:
     """Fill missing values race-by-race using session median, then fallbacks."""
     filled_df = df.copy()
+
+    def _fill_group_with_median(series: pd.Series) -> pd.Series:
+        non_null = series.dropna()
+        if non_null.empty:
+            return series
+        return series.fillna(float(non_null.median()))
+
     for feature in feature_columns:
-        filled_df[feature] = filled_df.groupby(["Year", "Round"])[feature].transform(
-            lambda series: series.fillna(series.median())
-        )
+        filled_df[feature] = filled_df.groupby(["Year", "Round"])[feature].transform(_fill_group_with_median)
         if fallback_medians and feature in fallback_medians:
             filled_df[feature] = filled_df[feature].fillna(float(fallback_medians[feature]))
-        filled_df[feature] = filled_df[feature].fillna(filled_df[feature].median())
+        non_null_feature = filled_df[feature].dropna()
+        if not non_null_feature.empty:
+            filled_df[feature] = filled_df[feature].fillna(float(non_null_feature.median()))
     return filled_df
 
 
@@ -432,7 +464,7 @@ def _load_prediction_quali_frame(year: int, round_number: int) -> pd.DataFrame:
     """Load qualifying data for a target race and construct base prediction rows."""
     try:
         quali_session = fastf1.get_session(year, round_number, "Q")
-        quali_session.load()
+        quali_session.load(laps=False, telemetry=False, weather=False, messages=False)
     except Exception as exc:  # noqa: BLE001
         raise RuntimeError(f"Unable to load qualifying data for {year} round {round_number}: {exc}") from exc
 
@@ -503,4 +535,3 @@ def predict_race(year: int, round_number: int) -> pd.DataFrame:
     if TRAINED_ARTIFACTS is None:
         raise RuntimeError("No trained model in memory. Run train_full_pipeline() before calling predict_race().")
     return _predict_race_with_artifacts(year=year, round_number=round_number, artifacts=TRAINED_ARTIFACTS)
-
