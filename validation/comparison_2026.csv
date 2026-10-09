@@ -1,0 +1,7 @@
+Model,Rank MAE,Spearman,Top-10 membership (%),Top-10 exact positions (%),Winner accuracy (%),Winner in predicted top 3 (%),Exact podium (%),Races,Weather,SelectedBeforeHoldout
+original forest (2014 + 2022),3.8806818181818175,0.6233766233766235,76.25,13.125,12.5,37.5,0.0,16,False,False
+qualifying,3.4318181818181817,0.6705957086391869,75.625,17.5,68.75,93.75,6.25,16,True,True
+forest,3.664772727272727,0.6491389045736873,73.125,19.375,56.25,93.75,0.0,16,False,False
+pairwise,3.511363636363636,0.6682665160926031,75.0,19.375,62.5,93.75,0.0,16,False,False
+forest,3.6875,0.6458215697346134,72.5,16.25,68.75,81.25,0.0,16,True,False
+pairwise,3.528409090909091,0.6649491812535292,76.25,15.0,56.25,87.5,0.0,16,True,False
